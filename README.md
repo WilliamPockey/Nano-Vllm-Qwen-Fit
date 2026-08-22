@@ -2,38 +2,49 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+# Nano-Vllm-Qwen-Fit
 
-# Nano-vLLM
+本项目源自 [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)，是在其基础上修改而来的分支。感谢原作者 [GeeeekExplorer](https://github.com/GeeeekExplorer) 的优秀工作！
 
-A lightweight vLLM implementation built from scratch.
+本项目保留了原项目的核心能力：轻量、易读的 vLLM 离线推理实现（约 1,200 行 Python 代码），以及 Prefix Caching、Tensor Parallelism、Torch Compile、CUDA Graph 等优化，推理速度与 vLLM 相当。
 
-## Key Features
+## 🚧 开发中的新特性
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+- [ ] **新模型支持**
+  - [ ] Qwen3.8-27B-FP8
+  - [ ] Qwen3.5-35B-A3B-FP8
+  - [ ] Qwen3.5-0.8B
+- [ ] **分布式支持**
+- [ ] **支持 LoRA 加载**
 
 ## Installation
 
+直接从本仓库安装：
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install git+https://github.com/WilliamPockey/Nano-Vllm-Qwen-Fit.git
 ```
 
-## Model Download
+或克隆后本地安装：
 
-To download the model weights manually, use the following command:
+```bash
+git clone git@github.com:WilliamPockey/Nano-Vllm-Qwen-Fit.git
+cd Nano-Vllm-Qwen-Fit
+pip install .
+```
+
+## Quick Start
+
+下载模型权重（以 Qwen3-0.6B 为例）：
+
 ```bash
 huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
   --local-dir ~/huggingface/Qwen3-0.6B/ \
   --local-dir-use-symlinks False
 ```
 
-## Quick Start
+用法参见 `example.py`。API 与 vLLM 接口保持一致，仅 `LLM.generate` 方法略有差异：
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
@@ -42,25 +53,3 @@ prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
-
-## Benchmark
-
-See `bench.py` for benchmark.
-
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
-
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
