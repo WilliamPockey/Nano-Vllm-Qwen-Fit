@@ -14,6 +14,7 @@
 
 - **修改文件**：
   - `layers/layernorm.py` - 适配Qwen3.5-0.8B的GemmaRMSNorm和RMSNormGated
+  - `layers/rotary_embedding.py` - 适配Qwen3.5-0.8B的部分位置编码与MRoPE
 
 ### v1.1 (2026-08-26)
 
