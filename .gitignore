@@ -5,6 +5,7 @@ __pycache__/
 
 #some reference code or data
 reference
+.commandcode
 
 # C extensions
 *.so
