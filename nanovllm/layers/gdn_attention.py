@@ -266,7 +266,7 @@ class GDNAttention(nn.Module):
         if has_initial:
             win = torch.cat([self.conv_pool[slot], x], dim=-1)
         else:
-            win = F.pad(x, (0, 0, self.conv_kernel_size - 1, 0))
+            win = F.pad(x, (self.conv_kernel_size - 1, 0))
         conv_out = F.conv1d(win, self.conv1d.weight, groups=self.conv_dim)[:, -L:]
         conv_out = F.silu(conv_out)
         if slot is not None:
@@ -287,7 +287,7 @@ class GDNAttention(nn.Module):
         )
         if slot is not None:
             self.ssm_pool[slot] = final_state[0]
-        return o[0]                                          # [L, value_dim]
+        return o[0].reshape(L, self.value_dim)      # [L, value_dim]
 
     def _decode_batch(
         self,
