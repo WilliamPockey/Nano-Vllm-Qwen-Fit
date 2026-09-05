@@ -15,7 +15,7 @@
 - **修改文件**：
   - `layers/linear.py` - 适配Qwen3.5-0.8B的q_gate权重加载
 - **新增文件**：
-  - `layers/gdn_attention.py` - Qwen3.5-0.8B的GDNAttention模块及具体的Gated Delta Rule
+  - `layers/gdn_attention.py` - Qwen3.5-0.8B的GDNAttention模块及具体的Gated Delta Rule(!!!模块暂未实现并行，待优化!!!)
 
 ### v1.2 (2026-09-01)
 
