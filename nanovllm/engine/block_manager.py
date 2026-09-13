@@ -25,8 +25,9 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, disable_prefix_cache: bool = False):
         self.block_size = block_size
+        self.disable_prefix_cache = disable_prefix_cache
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -56,6 +57,10 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        if self.disable_prefix_cache:
+            if len(self.free_block_ids) < seq.num_blocks:
+                return -1
+            return 0
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
