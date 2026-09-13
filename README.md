@@ -10,6 +10,15 @@
 
 ## 📝 更新日志
 
+### v1.4 (2026-09-13)
+
+- **新增文件**：
+  - `config.py` - 支持Qwen3.5-0.8B的复合Config读取
+  - `utils/context.py` - 增加GDN缓存所需字段
+  - `engine/sequence.py` - 增加GDN_slot字段
+  - `engine/block_manager.py` - 支持Qwen3.5-0.8B的关闭Prefix缓存复用
+  - `engine/scheduler.py` - 增加GDN_Slot分配与释放
+
 ### v1.3 (2026-09-05)
 
 - **修改文件**：
