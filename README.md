@@ -10,6 +10,18 @@
 
 ## 📝 更新日志
 
+### v1.5 (2026-11-11)
+
+- **修改文件**：
+  - `engine/model_runner.py` - 实现Qwen3.5的双轨缓存：KV池第一维改为full_attention层数（24层中仅6层），新增GDN状态池（conv窗口+fp32 ssm状态，约19.5MB/序列），按显存预算折算槽位数并回填config供调度器使用；`prepare_prefill`/`prepare_decode`新增gdn_slot、has_initial与CPU侧cu_seqlens的注入；qwen3_5_text强制eager并校验tp=1；权重加载跳过`mtp.*`与`model.visual.*`前缀
+  - `layers/gdn_attention.py` - 补充GQA头展开（`repeat_interleave`，适配num_v_heads>num_k_heads的模型）；槽位与分段信息改读context中的CPU list，避免每层device→host同步；明确状态池采用FLA `[H,K,V]` 布局并补全形状约定注释
+  - `utils/loader.py` - `load_model` 新增 `skip_prefixes` 参数，支持按前缀跳过权重（默认空，不影响原有模型）
+  - `engine/scheduler.py` - 补上 `self.is_hybrid` 初始化
+- **问题修复**：
+  - 修复KV池块字节数仍按全量层数计算、导致显存预算偏差4倍的问题
+  - 修复Scheduler使用未定义属性 `self.is_hybrid` 导致的 `AttributeError`
+  - 修复 `load_model` 签名与调用方不一致导致的 `TypeError`
+
 ### v1.4 (2026-09-13)
 
 - **新增文件**：

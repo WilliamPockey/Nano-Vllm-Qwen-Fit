@@ -12,6 +12,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        self.is_hybrid = config.is_hybrid
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
                                           disable_prefix_cache=config.is_hybrid)
         if self.is_hybrid:

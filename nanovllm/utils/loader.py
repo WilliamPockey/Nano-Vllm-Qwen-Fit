@@ -9,11 +9,13 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
-def load_model(model: nn.Module, path: str):
+def load_model(model: nn.Module, path: str, skip_prefixes: tuple[str, ...] = ()):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                if skip_prefixes and weight_name.startswith(skip_prefixes):
+                    continue
                 for k in packed_modules_mapping:
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]

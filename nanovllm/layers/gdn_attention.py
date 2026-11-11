@@ -7,7 +7,12 @@ Cache management reference: vllm qwen_gdn_linear_attn.py (_forward_core, slot ga
 接口约定（与 nano-vllm 其它层一致）:
 - forward 输入 hidden_states 是 2D packed 形式 [num_tokens, hidden_size]；
 - 状态由 model_runner 注入到 self.conv_pool / self.ssm_pool（本层在层序内的视图），
-  槽位与 has_initial 通过 context.gdn_slots / context.gdn_has_initial 传入；
+  conv_pool: [num_slots, conv_dim, kernel-1]，存**未卷积**的输入尾部窗口，dtype = 模型 dtype；
+  ssm_pool:  [num_slots, num_v_heads, head_k_dim, head_v_dim]，**fp32**（FLA 约定 [K,V] 布局；
+  vLLM 的 fused triton kernel 用转置布局 [HV, V, K]，将来若移植 vLLM kernel 需 transpose，
+  移植 fla 库 kernel 则与本布局直接兼容）；
+- 槽位与 has_initial 通过 context.gdn_slots_cpu / context.gdn_has_initial 传入
+  （decode 路径用 context.gdn_slots 张量做池索引）；
 - warmup 时池未分配（numel()==0），走"零初始状态、不回写"分支。
 """
 
@@ -191,9 +196,11 @@ class GDNAttention(nn.Module):
     ) -> None:
         super().__init__()
         assert dist.get_world_size() == 1, "GDN v1 requires tensor_parallel_size=1"
+        assert num_v_heads % num_k_heads == 0, "num_v_heads must be divisible by num_k_heads"
         self.hidden_size = hidden_size
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
+        self.num_kv_groups = num_v_heads // num_k_heads   # 0.8B: 16/16 = 1（恒等）
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.key_dim = head_k_dim * num_k_heads
@@ -219,6 +226,7 @@ class GDNAttention(nn.Module):
         self.out_proj = RowParallelLinear(self.value_dim, hidden_size, bias=False)
 
         # 占位；model_runner 按线性层出现顺序注入 conv_cache[lid] / ssm_cache[lid]
+        # 形状约定见文件头 docstring（ssm 为 FLA [H, K, V] 布局、fp32）
         self.conv_pool = self.ssm_pool = torch.tensor([])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -232,13 +240,13 @@ class GDNAttention(nn.Module):
         beta = b.sigmoid()
 
         warmup = self.conv_pool.numel() == 0
-        if context.is_prefill or warmup:
-            cu = context.cu_seqlens_q.tolist()
+        if context.is_prefill:
+            # CPU list 由 model_runner.prepare_* 一次算好，避免每层 device->host 同步
+            cu = context.gdn_cu_seqlens
             if warmup:
                 slots, has_initial = [None] * (len(cu) - 1), [False] * (len(cu) - 1)
             else:
-                slots = context.gdn_slots.tolist()
-                has_initial = context.gdn_has_initial
+                slots, has_initial = context.gdn_slots_cpu, context.gdn_has_initial
             core = torch.empty_like(z)
             for i, slot in enumerate(slots):
                 t0, t1 = cu[i], cu[i + 1]
@@ -277,6 +285,10 @@ class GDNAttention(nn.Module):
         q = q.reshape(L, self.num_k_heads, self.head_k_dim)[None]
         k = k.reshape(L, self.num_k_heads, self.head_k_dim)[None]
         v = v.reshape(L, self.num_v_heads, self.head_v_dim)[None]
+        if self.num_kv_groups > 1:
+            # 对齐 HF（l2norm 之前、按头展开；对 0.8B 的 16/16 是 no-op）
+            q = q.repeat_interleave(self.num_kv_groups, dim=2)
+            k = k.repeat_interleave(self.num_kv_groups, dim=2)
 
         initial_state = self.ssm_pool[slot][None] if has_initial else None
         o, final_state = torch_chunk_gated_delta_rule(
@@ -306,6 +318,9 @@ class GDNAttention(nn.Module):
         q = q.reshape(B, 1, self.num_k_heads, self.head_k_dim)
         k = k.reshape(B, 1, self.num_k_heads, self.head_k_dim)
         v = v.reshape(B, 1, self.num_v_heads, self.head_v_dim)
+        if self.num_kv_groups > 1:
+            q = q.repeat_interleave(self.num_kv_groups, dim=2)
+            k = k.repeat_interleave(self.num_kv_groups, dim=2)
 
         # 高级索引 gather 出的已是拷贝，算完 scatter 回写，无原地别名问题
         initial_state = self.ssm_pool[slots]                 # [B, H, K, V] fp32

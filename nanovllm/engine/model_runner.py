@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.models import model_dict
+from nanovllm.layers.gdn_attention import GDNAttention
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -20,8 +21,11 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         # MoE dynamic expert routing (python loop + index_add_) is not CUDA-graph friendly
-        if hf_config.model_type == "qwen3_moe":
+        # hybrid: GDN 的逐序列 python 循环同样不兼容 CUDA graph（Config 已置 True，此处兜底）
+        if hf_config.model_type in ("qwen3_moe", "qwen3_5_text"):
             self.enforce_eager = True
+        if config.is_hybrid:
+            assert config.tensor_parallel_size == 1, "GDN v1 requires tensor_parallel_size=1"
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -34,7 +38,9 @@ class ModelRunner:
         torch.set_default_dtype(self.dtype)
         torch.set_default_device("cuda")
         self.model = model_dict[hf_config.model_type](hf_config)
-        load_model(self.model, config.model)
+        # Qwen3.5 checkpoint 携带 MTP head 与视觉塔，Phase B 文本阶段整前缀跳过
+        skip_prefixes = ("mtp.", "model.visual.") if config.is_hybrid else ()
+        load_model(self.model, config.model, skip_prefixes=skip_prefixes)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -114,16 +120,54 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        layer_types = getattr(hf_config, "layer_types", None)
+        if layer_types is not None:
+            # hybrid：KV 只建在 full_attention 层上（0.8B: 24 层中 6 层）
+            num_attn_layers = layer_types.count("full_attention")
+            num_gdn_layers = layer_types.count("linear_attention")
+        else:
+            num_attn_layers = hf_config.num_hidden_layers
+            num_gdn_layers = 0
+
+        block_bytes = 2 * num_attn_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
+        budget = total * config.gpu_memory_utilization - used - peak + current
+
+        if num_gdn_layers:
+            # GDN 状态池：每个活跃序列一个槽，整槽随序列生命周期，不按块恢复
+            conv_dim = 2 * hf_config.linear_num_key_heads * hf_config.linear_key_head_dim \
+                + hf_config.linear_num_value_heads * hf_config.linear_value_head_dim
+            conv_window = hf_config.linear_conv_kernel_dim - 1
+            per_slot_bytes = num_gdn_layers * (conv_dim * conv_window * self.dtype.itemsize
+                + hf_config.linear_num_value_heads * hf_config.linear_key_head_dim
+                * hf_config.linear_value_head_dim * 4)          # ssm 固定 fp32 (mamba_ssm_dtype)
+            n_slots = config.num_gdn_slots if config.num_gdn_slots > 0 else 64
+            n_slots = max(1, min(n_slots, int(budget // 3) // per_slot_bytes))
+            config.num_gdn_slots = n_slots    # 回填！Scheduler 在本方法之后构造（见 llm_engine 顺序）
+            budget -= n_slots * per_slot_bytes
+            self.conv_cache = torch.empty(num_gdn_layers, n_slots, conv_dim, conv_window)
+            self.ssm_cache = torch.empty(num_gdn_layers, n_slots,
+                                            hf_config.linear_num_value_heads,
+                                            hf_config.linear_key_head_dim,
+                                            hf_config.linear_value_head_dim,
+                                            dtype=torch.float32)
+            gdn_layer_id = 0
+            for module in self.model.modules():
+                if isinstance(module, GDNAttention):
+                    module.conv_pool = self.conv_cache[gdn_layer_id]
+                    module.ssm_pool = self.ssm_cache[gdn_layer_id]
+                    gdn_layer_id += 1
+            assert gdn_layer_id == num_gdn_layers
+
+        config.num_kvcache_blocks = int(budget) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_attn_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        assert layer_id == num_attn_layers
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -140,6 +184,8 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        gdn_slots = []
+        gdn_has_initial = []
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -151,6 +197,8 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            gdn_slots.append(seq.gdn_slot)
+            gdn_has_initial.append(seq.num_cached_tokens > 0)
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size
@@ -166,12 +214,16 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        gdn_cu_seqlens = list(cu_seqlens_q)    # 转张量前先留一份 CPU list 给 GDN 层
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        gdn_slots_t = torch.tensor(gdn_slots, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    gdn_slots=gdn_slots_t, gdn_slots_cpu=gdn_slots,
+                    gdn_has_initial=gdn_has_initial, gdn_cu_seqlens=gdn_cu_seqlens)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -179,17 +231,21 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        gdn_slots = []
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            gdn_slots.append(seq.gdn_slot)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        gdn_slots_t = torch.tensor(gdn_slots, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    gdn_slots=gdn_slots_t, gdn_slots_cpu=gdn_slots)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
