@@ -13,7 +13,7 @@
 ### v1.6 (2026-11-11)
 
 - **新增文件**：
-  - `models/qwen3_5.py` - Qwen3.5-0.8B文本侧模型实现：GDN与全注意力混合的24层解码器、q_proj双投影含gate、Gemma归一化、partial rotary
+  - `models/qwen3_5.py` - Qwen3.5-0.8B文本侧模型实现
 - **修改文件**：
   - `models/models.py` - 注册 `qwen3_5` 与 `qwen3_5_text`
 
